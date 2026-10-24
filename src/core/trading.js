@@ -296,7 +296,28 @@ export async function getPositions() {
  * Account Manager panel. Match by symbol when given.
  */
 export async function closePosition({ symbol, close_all = false, cancel_orders = false } = {}) {
-  const result = await evaluate(`
+  // Clicking a row's Close button opens a React confirmation dialog
+  // asynchronously, so the confirm button does not exist yet in the SAME
+  // evaluate() — it has to be clicked in a second pass after a short wait.
+  // This mirrors the flow verified live in scripts/auto_trader.js:
+  //   close-settings-cell-button  ->  (dialog)  ->  submit-button
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Pass 0: make sure the Positions tab is the active one (the close buttons
+  // only exist in the DOM when that tab is showing).
+  await evaluate(`
+    (function() {
+      ${PAGE_HELPERS}
+      var tab = tvFindByText(['Positions']);
+      if (tab) tab.click();
+      return !!tab;
+    })()
+  `);
+  await sleep(400);
+
+  // Pass 1: click the Close button on each matching position row (and cancel
+  // buttons on matching order rows when requested). Returns how many were hit.
+  const pass1 = await evaluate(`
     (function() {
       ${PAGE_HELPERS}
       var actions = [];
@@ -305,77 +326,85 @@ export async function closePosition({ symbol, close_all = false, cancel_orders =
         var closeAll = ${JSON.stringify(!!close_all)};
         var cancelOrders = ${JSON.stringify(!!cancel_orders)};
 
-        function rowMatchesSymbol(row) {
+        function rowOf(el) { return el.closest('tr, [class*="row"]') || el.parentElement; }
+        function matchesSymbol(row) {
           if (!wantSymbol) return true;
-          var txt = (row.textContent || '').toUpperCase();
+          var txt = ((row && row.textContent) || '').toUpperCase();
           var want = wantSymbol.toUpperCase().split(':').pop();
           return txt.indexOf(want) !== -1;
         }
 
-        // --- Close positions ---
-        var posRoot = document.querySelector('[data-name="positions"]')
-          || document.querySelector('[class*="positionsTable"]')
-          || document.querySelector('[class*="accountManager"]');
+        // --- Close positions (verified selector first, legacy as fallback) ---
+        var closeBtns = Array.prototype.slice.call(
+          document.querySelectorAll('[data-name="close-settings-cell-button"]')
+        ).filter(function (b) { return b.offsetParent !== null; });
+        if (!closeBtns.length) {
+          closeBtns = Array.prototype.slice.call(document.querySelectorAll(
+            '[data-name="close-position-button"], [class*="closeButton"], button[class*="close"], [aria-label="Close position"]'
+          )).filter(function (b) { return b.offsetParent !== null; });
+        }
         var closed = 0;
-        if (posRoot) {
-          var rows = posRoot.querySelectorAll('[data-name="positions-item"], [class*="row"][class*="position"], tr');
-          for (var r = 0; r < rows.length; r++) {
-            var row = rows[r];
-            if (row.offsetParent === null) continue;
-            if (!rowMatchesSymbol(row)) continue;
-            var closeBtn = row.querySelector('[data-name="close-position-button"]')
-              || row.querySelector('[class*="closeButton"]')
-              || row.querySelector('button[class*="close"]')
-              || row.querySelector('[aria-label="Close position"]');
-            if (closeBtn) {
-              closeBtn.click();
-              closed++;
-              actions.push({ action: 'close_position', row_text: (row.textContent || '').trim().slice(0, 80) });
-              if (!closeAll) break;
-            }
-          }
+        for (var i = 0; i < closeBtns.length; i++) {
+          var row = rowOf(closeBtns[i]);
+          if (!matchesSymbol(row)) continue;
+          closeBtns[i].click();
+          closed++;
+          actions.push({ action: 'close_position', row_text: ((row && row.textContent) || '').trim().slice(0, 80) });
+          if (!closeAll) break;
         }
 
-        // --- Cancel resting orders ---
+        // --- Cancel resting orders (best effort) ---
         var cancelled = 0;
         if (cancelOrders) {
-          var ordRoot = document.querySelector('[data-name="orders"]') || document.querySelector('[class*="ordersTable"]');
-          if (ordRoot) {
-            var ordRows = ordRoot.querySelectorAll('[data-name="orders-item"], [class*="row"][class*="order"], tr');
-            for (var o = 0; o < ordRows.length; o++) {
-              var orow = ordRows[o];
-              if (orow.offsetParent === null) continue;
-              if (!rowMatchesSymbol(orow)) continue;
-              var cancelBtn = orow.querySelector('[data-name="cancel-order-button"]')
-                || orow.querySelector('[class*="cancelButton"]')
-                || orow.querySelector('button[class*="cancel"]')
-                || orow.querySelector('[aria-label="Cancel order"]');
-              if (cancelBtn) {
-                cancelBtn.click();
-                cancelled++;
-                actions.push({ action: 'cancel_order', row_text: (orow.textContent || '').trim().slice(0, 80) });
-                if (!closeAll) break;
-              }
-            }
+          var cancelBtns = Array.prototype.slice.call(document.querySelectorAll(
+            '[data-name="cancel-settings-cell-button"], [data-name="cancel-order-button"], [class*="cancelButton"], button[class*="cancel"], [aria-label="Cancel order"]'
+          )).filter(function (b) { return b.offsetParent !== null; });
+          for (var o = 0; o < cancelBtns.length; o++) {
+            var orow = rowOf(cancelBtns[o]);
+            if (!matchesSymbol(orow)) continue;
+            cancelBtns[o].click();
+            cancelled++;
+            actions.push({ action: 'cancel_order', row_text: ((orow && orow.textContent) || '').trim().slice(0, 80) });
+            if (!closeAll) break;
           }
         }
 
-        // Some builds pop a confirmation dialog — accept it.
-        var confirm = tvFindByText(['Close', 'Confirm', 'Yes', 'OK']);
-        if (confirm && (closed > 0 || cancelled > 0)) {
-          // Only click if a modal/dialog is actually present to avoid stray clicks.
-          var dialog = document.querySelector('[class*="dialog"], [role="dialog"]');
-          if (dialog && dialog.contains(confirm)) { confirm.click(); actions.push({ action: 'confirm_dialog', clicked: true }); }
-        }
-
-        if (closed === 0 && cancelled === 0) {
-          return { success: false, error: wantSymbol ? ('No matching position/order found for ' + wantSymbol) : 'No positions or orders found to close. Is the Paper Trading panel open?', actions: actions };
-        }
-        return { success: true, closed_positions: closed, cancelled_orders: cancelled, symbol: wantSymbol, close_all: closeAll, actions: actions };
+        return { closed: closed, cancelled: cancelled, actions: actions };
       } catch (e) {
-        return { success: false, error: e.message, actions: actions };
+        return { closed: 0, cancelled: 0, actions: actions, error: e.message };
       }
     })()
   `);
-  return result;
+
+  if (pass1.error) return { success: false, error: pass1.error, actions: pass1.actions };
+  if (pass1.closed === 0 && pass1.cancelled === 0) {
+    return {
+      success: false,
+      error: symbol ? ('No matching position/order found for ' + symbol) : 'No positions or orders found to close. Is the Paper Trading panel open?',
+      actions: pass1.actions,
+    };
+  }
+
+  // Pass 2: confirm the dialog TradingView pops after a close/cancel.
+  await sleep(700);
+  const pass2 = await evaluate(`
+    (function() {
+      ${PAGE_HELPERS}
+      var dialog = document.querySelector('[role="dialog"], [class*="dialog"]');
+      if (!dialog) return { confirmed: false, note: 'no confirmation dialog (already applied?)' };
+      var btn = dialog.querySelector('[data-name="submit-button"]') || tvFindByText(['Close position', 'Close', 'Confirm', 'Yes', 'OK']);
+      if (btn && dialog.contains(btn)) { btn.click(); return { confirmed: true }; }
+      return { confirmed: false, note: 'confirm button not found in dialog' };
+    })()
+  `);
+
+  return {
+    success: true,
+    closed_positions: pass1.closed,
+    cancelled_orders: pass1.cancelled,
+    symbol: symbol ?? null,
+    close_all: !!close_all,
+    confirmed: pass2.confirmed,
+    actions: pass1.actions.concat([{ action: 'confirm_dialog', clicked: pass2.confirmed, note: pass2.note }]),
+  };
 }
