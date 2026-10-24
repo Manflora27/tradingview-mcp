@@ -33,11 +33,12 @@ Write-Host "Task    : $TaskName (every 15 minutes)"
 # Action: run the .bat with the project as working directory.
 $action = New-ScheduledTaskAction -Execute $BatPath -WorkingDirectory $ProjectDir
 
-# Trigger: start ~1 min from now, then repeat every 15 min, effectively forever.
+# Trigger: start ~1 min from now, then repeat every 15 min, indefinitely.
+# NOTE: do NOT pass -RepetitionDuration [TimeSpan]::MaxValue — it overflows the
+# task XML (HRESULT 0x80041318). Omitting it repeats forever on Win10+.
 $start   = (Get-Date).AddMinutes(1)
 $trigger = New-ScheduledTaskTrigger -Once -At $start `
-    -RepetitionInterval (New-TimeSpan -Minutes 15) `
-    -RepetitionDuration ([TimeSpan]::MaxValue)
+    -RepetitionInterval (New-TimeSpan -Minutes 15)
 
 # Settings: allow on battery, don't stop if it runs a little long, run hidden.
 $settings = New-ScheduledTaskSettingsSet `
